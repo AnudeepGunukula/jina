@@ -16,34 +16,40 @@ if False:
 class PrefetchCaller:
     """An async zmq request sender to be used in the Gateway"""
 
-    def __init__(self, args: argparse.Namespace, zmqlet: 'AsyncZmqlet'):
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        zmqlet: 'AsyncZmqlet' = None,
+        grpclet: 'Grpclet' = None,
+    ):
         """
         :param args: args from CLI
         :param zmqlet: zeromq object
         """
         self.args = args
-        self.zmqlet = zmqlet
-        self.name = args.name or self.__class__.__name__
-
         self.logger = JinaLogger(self.name, **vars(args))
         self._message_buffer: Dict[str, Future[Message]] = dict()
-        self._receive_task = get_or_reuse_loop().create_task(self._receive())
+        self.name = args.name or self.__class__.__name__
+
+        if grpclet is None:
+            self.use_zmq = True
+            self.iolet = zmqlet
+            self._receive_task = get_or_reuse_loop().create_task(self._receive())
+        else:
+            self.use_zmq = False
+            self.iolet = grpclet
+            self.iolet.callback = lambda msg: self._process_message(msg.request)
+            self._receive_task = get_or_reuse_loop().create_task(self.iolet.start())
 
     async def _receive(self):
         try:
             while True:
-                message = await self.zmqlet.recv_message(callback=lambda x: x.response)
+                message = await self.iolet.recv_message(callback=lambda x: x.response)
                 # during shutdown the socket will return None
                 if message is None:
                     break
 
-                if message.request_id in self._message_buffer:
-                    future = self._message_buffer.pop(message.request_id)
-                    future.set_result(message)
-                else:
-                    self.logger.warning(
-                        f'Discarding unexpected message with request id {message.request_id}'
-                    )
+                await self._process_message(message)
         except asyncio.CancelledError:
             raise
         finally:
@@ -52,6 +58,15 @@ class PrefetchCaller:
                     'PrefetchCaller closed, all outstanding requests canceled'
                 )
             self._message_buffer.clear()
+
+    async def _process_message(self, message):
+        if message.request_id in self._message_buffer:
+            future = self._message_buffer.pop(message.request_id)
+            future.set_result(message)
+        else:
+            self.logger.warning(
+                f'Discarding unexpected message with request id {message.request_id}'
+            )
 
     async def close(self):
         """
@@ -68,7 +83,7 @@ class PrefetchCaller:
         :yield: message
         """
         self.args: argparse.Namespace
-        self.zmqlet: 'AsyncZmqlet'
+        self.iolet: 'AsyncZmqlet'
         self.logger: JinaLogger
 
         if self._receive_task.done():
@@ -98,7 +113,7 @@ class PrefetchCaller:
                     future = get_or_reuse_loop().create_future()
                     self._message_buffer[next_request.request_id] = future
                     asyncio.create_task(
-                        self.zmqlet.send_message(
+                        self.iolet.send_message(
                             Message(None, next_request, 'gateway', **vars(self.args))
                         )
                     )
@@ -129,9 +144,9 @@ class PrefetchCaller:
             while prefetch_task:
                 if self.logger.debug_enabled:
                     self.logger.debug(
-                        f'send: {self.zmqlet.msg_sent} '
-                        f'recv: {self.zmqlet.msg_recv} '
-                        f'pending: {self.zmqlet.msg_sent - self.zmqlet.msg_recv}'
+                        f'send: {self.iolet.msg_sent} '
+                        f'recv: {self.iolet.msg_recv} '
+                        f'pending: {self.iolet.msg_sent - self.iolet.msg_recv}'
                     )
                 onrecv_task.clear()
                 for r in asyncio.as_completed(prefetch_task):
