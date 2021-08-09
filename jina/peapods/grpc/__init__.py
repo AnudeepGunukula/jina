@@ -7,6 +7,7 @@ from google.protobuf import struct_pb2
 from jina.helper import get_or_reuse_loop
 from jina.proto import jina_pb2_grpc, jina_pb2
 from jina.types.message import Message
+from jina.types.message.common import ControlMessage
 from jina.types.routing.table import RoutingTable
 
 # TODO extract dynamic routing logic and merge with zmqlet
@@ -20,6 +21,7 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
 
     def __init__(
         self,
+        async_loop,
         args: 'argparse.Namespace',
         message_callback: Callable[['Message'], 'Message'],
         logger: Optional['JinaLogger'] = None,
@@ -28,7 +30,7 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
         self._stubs = {}
         self._logger = logger
         self.callback = message_callback
-        self._loop = get_or_reuse_loop()
+        self._loop = async_loop
 
     def _get_dynamic_next_routes(self, message):
         routing_table = RoutingTable(message.envelope.routing_table)
@@ -45,6 +47,11 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
         return next_routes
 
     async def send_message(self, msg: 'Message', **kwargs):
+        """
+        Sends a message via gRPC to the target indicated in the message's routing table
+        :param msg: the protobuf message to send
+        :param kwargs: Additional arguments.
+        """
         routing_table = RoutingTable(msg.envelope.routing_table)
         next_targets = routing_table.get_next_targets()
 
@@ -58,7 +65,7 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
             new_message = await self._add_envelope(msg, target)
 
             if pod_address not in self._stubs:
-                await self._create_grpc_stub(pod_address)
+                self._stubs[pod_address] = Grpclet._create_grpc_stub(pod_address)
 
             try:
                 self._stubs[pod_address].Call(new_message)
@@ -66,17 +73,40 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
                 self._logger.error('Sending data request via grpc failed', ex)
                 raise ex
 
-    async def _create_grpc_stub(self, pod_address):
-        stub = jina_pb2_grpc.JinaDataRequestRPCStub(
-            grpc.aio.insecure_channel(
+    @staticmethod
+    def send_ctrl_msg(pod_address: str, command: str):
+        """
+        Sends a control message via gRPC to pod_address
+        :param pod_address: the pod to send the command to
+        :param command: the command to send (TERMINATE/ACTIVATE/...)
+        :returns: Empty protobuf struct
+        """
+        stub = Grpclet._create_grpc_stub(pod_address, is_async=False)
+        response = stub.Call(ControlMessage(command))
+        return response
+
+    @staticmethod
+    def _create_grpc_stub(pod_address, is_async=True):
+        if is_async:
+            channel = grpc.aio.insecure_channel(
                 pod_address,
                 options=[
                     ('grpc.max_send_message_length', -1),
                     ('grpc.max_receive_message_length', -1),
                 ],
             )
-        )
-        self._stubs[pod_address] = stub
+        else:
+            channel = grpc.insecure_channel(
+                pod_address,
+                options=[
+                    ('grpc.max_send_message_length', -1),
+                    ('grpc.max_receive_message_length', -1),
+                ],
+            )
+
+        stub = jina_pb2_grpc.JinaDataRequestRPCStub(channel)
+
+        return stub
 
     async def _add_envelope(self, msg, routing_table):
         new_envelope = jina_pb2.EnvelopeProto()
@@ -91,9 +121,13 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
         :param args: Extra positional arguments
         :param kwargs: Extra key-value arguments
         """
+        self._logger.debug('Close grpc server')
         await self._grpc_server.stop(grace=True)
 
     async def start(self):
+        """
+        Starts this Grpclet by starting its gRPC server
+        """
         self._grpc_server = grpc.aio.server(
             options=[
                 ('grpc.max_send_message_length', -1),
@@ -116,7 +150,7 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
         """
         if self.callback:
             if inspect.iscoroutinefunction(self.callback):
-                await self.callback(msg)
+                self._loop.create_task(self.callback(msg))
             else:
                 self.callback(msg)
         else:

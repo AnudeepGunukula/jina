@@ -45,7 +45,10 @@ class GRPCRuntime(AsyncNewLoopRuntime):
 
         if self.args.grpc_data_requests:
             self._grpclet = Grpclet(
-                args=self.args, message_callback=None, logger=self.logger
+                async_loop=self._loop,
+                args=self.args,
+                message_callback=None,
+                logger=self.logger,
             )
             self._prefetcher = GRPCPrefetchCall(self.args, grpclet=self._grpclet)
         else:

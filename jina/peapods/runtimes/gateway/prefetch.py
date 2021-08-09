@@ -25,11 +25,12 @@ class PrefetchCaller:
         """
         :param args: args from CLI
         :param zmqlet: zeromq object
+         :param grpclet: grpclet to use if grpc data requests are enabled
         """
         self.args = args
+        self.name = args.name or self.__class__.__name__
         self.logger = JinaLogger(self.name, **vars(args))
         self._message_buffer: Dict[str, Future[Message]] = dict()
-        self.name = args.name or self.__class__.__name__
 
         if grpclet is None:
             self.use_zmq = True
@@ -38,8 +39,11 @@ class PrefetchCaller:
         else:
             self.use_zmq = False
             self.iolet = grpclet
-            self.iolet.callback = lambda msg: self._process_message(msg.request)
+            self.iolet.callback = self._unwrap_request
             self._receive_task = get_or_reuse_loop().create_task(self.iolet.start())
+
+    async def _unwrap_request(self, msg):
+        return await self._process_message(msg.request)
 
     async def _receive(self):
         try:

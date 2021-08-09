@@ -1,24 +1,31 @@
 import time
+import traceback
 from abc import ABC
+from asyncio import CancelledError
 from collections import defaultdict
+from typing import Optional, Union
+
+from grpc import RpcError
 
 from jina.enums import OnErrorStrategy
 from jina.excepts import NoExplicitMessage, ChainedPodException, RuntimeTerminated
 from jina.helper import get_or_reuse_loop, random_identity
 from jina.peapods.grpc import Grpclet
 from jina.peapods.runtimes.base import BaseRuntime
-from jina.peapods.runtimes.request_handlers.data_request_handler import DataRequestHandler
+from jina.peapods.runtimes.request_handlers.data_request_handler import (
+    DataRequestHandler,
+)
 from jina.proto import jina_pb2
 
+from jina.types.routing.table import RoutingTable
 
-# TODO unify pre/post hook logic
-class GRPCRuntime(BaseRuntime, ABC):
+
+class GRPCDataRuntime(BaseRuntime, ABC):
     """Runtime procedure leveraging :class:`Grpclet` for sending DataRequests"""
 
-    def __init__(self, args: 'argparse.Namespace', logger: 'JinaLogger', **kwargs):
+    def __init__(self, args: 'argparse.Namespace', **kwargs):
         """Initialize grpc and data request handling.
         :param args: args from CLI
-        :param logger: the logger to use
         :param kwargs: extra keyword arguments
         """
         super().__init__(args, **kwargs)
@@ -29,36 +36,128 @@ class GRPCRuntime(BaseRuntime, ABC):
         self._pending_msgs = defaultdict(list)  # type: Dict[str, List['Message']]
         self._partial_requests = None
 
-        self._data_request_handler = DataRequestHandler(args, logger)
+        self._data_request_handler = DataRequestHandler(args, self.logger)
         self._grpclet = Grpclet(
-            args=self.args, message_callback=self._callback, logger=self.logger
+            async_loop=self._loop,
+            args=self.args,
+            message_callback=self._callback,
+            logger=self.logger,
         )
 
     def run_forever(self):
         """Start the `Grpclet`."""
-        self._loop.run_until_complete(self._grpclet.start())
+        self.logger.debug('Run GRPCDataRuntime')
+        self._grpclet_task = self._loop.create_task(self._grpclet.start())
+        try:
+            self._loop.run_until_complete(self._grpclet_task)
+        except CancelledError:
+            self.logger.debug('GRPCDataRuntime cancelled')
+            raise
 
     def teardown(self):
         """Close the `Grpclet` and `DataRequestHandler`."""
-        self._grpclet.close()
+        self.logger.debug('Teardown GRPCDataRuntime')
+
         self._data_request_handler.close()
+        self._loop.stop()
         self._loop.close()
+
         super().teardown()
+
+    def _close_grpclet(self):
+        self._loop.create_task(self._grpclet.close())
+        self._grpclet_task.cancel()
+
+    @staticmethod
+    def get_control_address(**kwargs):
+        """
+        Does return None, exists for keeping interface compatible with ZEDRuntime
+
+        :param kwargs: extra keyword arguments
+        :returns: None
+        """
+        return None
+
+    @staticmethod
+    def is_ready(ctrl_address: str, **kwargs) -> bool:
+        """
+        Check if status is ready.
+
+        :param ctrl_address: the address where the control message needs to be sent
+        :param kwargs: extra keyword arguments
+
+        :return: True if status is ready else False.
+        """
+
+        try:
+            response = Grpclet.send_ctrl_msg(ctrl_address, 'STATUS')
+        except RpcError:
+            return False
+
+        return True
+
+    @staticmethod
+    def activate(
+        **kwargs,
+    ):
+        """
+        Does nothing
+        :param kwargs: extra keyword arguments
+        """
+        pass
+
+    @staticmethod
+    def cancel(
+        control_address: str,
+        **kwargs,
+    ):
+        """
+        Cancel this runtime by sending a TERMINATE control message
+
+        :param control_address: the address where the control message needs to be sent
+        :param kwargs: extra keyword arguments
+        """
+        Grpclet.send_ctrl_msg(control_address, 'TERMINATE')
+
+    @staticmethod
+    def wait_for_ready_or_shutdown(
+        timeout: Optional[float],
+        ctrl_address: str,
+        shutdown_event: Union['multiprocessing.Event', 'threading.Event'],
+        **kwargs,
+    ):
+        """
+        Check if the runtime has successfully started
+
+        :param timeout: The time to wait before readiness or failure is determined
+        :param ctrl_address: the address where the control message needs to be sent
+        :param shutdown_event: the multiprocessing event to detect if the process failed
+        :param kwargs: extra keyword arguments
+        :return: True if is ready or it needs to be shutdown
+        """
+        timeout_ns = 1000000000 * timeout if timeout else None
+        now = time.time_ns()
+        while timeout_ns is None or time.time_ns() - now < timeout_ns:
+            if shutdown_event.is_set() or GRPCDataRuntime.is_ready(ctrl_address):
+                return True
+            time.sleep(0.1)
+
+        return False
 
     def _callback(self, msg: 'Message') -> None:
         try:
             msg = self._post_hook(self._handle(self._pre_hook(msg)))
-            self._grpclet.send_message(msg)
+            self._loop.create_task(self._grpclet.send_message(msg))
         except RuntimeTerminated:
             # this is the proper way to end when a terminate signal is sent
-            self._grpclet.close()
+            self._close_grpclet()
         except KeyboardInterrupt as kbex:
             self.logger.debug(f'{kbex!r} causes the breaking from the event loop')
-            self._grpclet.close()
+            self._close_grpclet()
         except (SystemError) as ex:
             # save executor
             self.logger.debug(f'{ex!r} causes the breaking from the event loop')
-            self._grpclet.close()
+            self._close_grpclet()
         except NoExplicitMessage:
             # silent and do not propagate message anymore
             # 1. wait partial message to be finished
@@ -81,7 +180,7 @@ class GRPCRuntime(BaseRuntime, ABC):
                     exc_info=not self.args.quiet_error,
                 )
 
-            self._grpclet.send_message(msg)
+            self._loop.create_task(self._grpclet.send_message(msg))
 
     def _handle(self, msg: 'Message') -> 'Message':
         """Register the current message to this pea, so that all message-related properties are up-to-date, including
@@ -95,11 +194,15 @@ class GRPCRuntime(BaseRuntime, ABC):
 
         # skip executor for non-DataRequest
         if msg.envelope.request_type != 'DataRequest':
+            if msg.request.command == 'TERMINATE':
+                raise RuntimeTerminated()
             self.logger.debug(f'skip executor: not data request')
             return msg
 
         req_id = msg.envelope.request_id
-        num_expected_parts = self._expect_parts(msg)
+        num_expected_parts = RoutingTable(
+            msg.envelope.routing_table
+        ).active_target_pod.expected_parts
         self._data_request_handler.handle(
             msg=msg,
             partial_requests=[m.request for m in self._pending_msgs[req_id]]
@@ -118,7 +221,9 @@ class GRPCRuntime(BaseRuntime, ABC):
         """
         msg.add_route(self.name, self._id)
 
-        expected_parts = self._expect_parts(msg)
+        expected_parts = RoutingTable(
+            msg.envelope.routing_table
+        ).active_target_pod.expected_parts
 
         req_id = msg.envelope.request_id
         if expected_parts > 1:
@@ -131,10 +236,9 @@ class GRPCRuntime(BaseRuntime, ABC):
             # otherwise a reducer will lose its function when earlier pods raise exception
             raise NoExplicitMessage
 
-
         if (
-                msg.envelope.status.code == jina_pb2.StatusProto.ERROR
-                and self.args.on_error_strategy >= OnErrorStrategy.SKIP_HANDLE
+            msg.envelope.status.code == jina_pb2.StatusProto.ERROR
+            and self.args.on_error_strategy >= OnErrorStrategy.SKIP_HANDLE
         ):
             raise ChainedPodException
 
@@ -144,14 +248,17 @@ class GRPCRuntime(BaseRuntime, ABC):
         """
         Post-hook function, what to do before handing out the message.
         :param msg: the transformed message
-        :return: `ZEDRuntime`
+        :return: `Message`
         """
         # do NOT access `msg.request.*` in the _pre_hook, as it will trigger the deserialization
         # all meta information should be stored and accessed via `msg.envelope`
 
         self._last_active_time = time.perf_counter()
 
-        if self._expect_parts(msg) > 1:
+        if (
+            RoutingTable(msg.envelope.routing_table).active_target_pod.expected_parts
+            > 1
+        ):
             msgs = self._pending_msgs.pop(msg.envelope.request_id)
             msg.merge_envelope_from(msgs)
 

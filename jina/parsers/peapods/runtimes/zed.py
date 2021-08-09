@@ -176,7 +176,7 @@ is wrong in the upstream, it is hard to carry this exception and moving forward 
         '--grpc-data-requests',
         action='store_true',
         default=False,
-        help='Tells if ZEDRuntime should use gRPC for data requests. Works only with dynamic routing out.'
+        help='Tells if a Pea should use gRPC for data requests. Works only with dynamic routing out.'
         if _SHOW_ALL_ARGS
         else argparse.SUPPRESS,
     )
