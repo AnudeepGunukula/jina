@@ -12,10 +12,11 @@ from jina.types.routing.table import RoutingTable
 
 # TODO extract dynamic routing logic and merge with zmqlet
 class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
-    """A `Grpclet` object can send/receive DataRequests via gRPC.
+    """A `Grpclet` object can send/receive Messages via gRPC.
 
+    :param async_loop: asyncio loop to use
     :param args: the parsed arguments from the CLI
-    :param args: the callback to call on received messages
+    :param message_callback: the callback to call on received messages
     :param logger: the logger to use
     """
 
