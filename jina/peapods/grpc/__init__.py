@@ -4,11 +4,11 @@ from typing import Optional, Callable
 import grpc
 from google.protobuf import struct_pb2
 
-from jina.helper import get_or_reuse_loop
 from jina.proto import jina_pb2_grpc, jina_pb2
 from jina.types.message import Message
 from jina.types.message.common import ControlMessage
 from jina.types.routing.table import RoutingTable
+
 
 # TODO extract dynamic routing logic and merge with zmqlet
 class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
@@ -32,20 +32,8 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
         self._logger = logger
         self.callback = message_callback
         self._loop = async_loop
-
-    def _get_dynamic_next_routes(self, message):
-        routing_table = RoutingTable(message.envelope.routing_table)
-        next_targets = routing_table.get_next_targets()
-        next_routes = []
-        for target, send_as_bind in next_targets:
-            pod_address = target.active_target_pod.full_address
-            if send_as_bind:
-                raise ValueError(
-                    f'Grpclet can not send as bind to target {pod_address}'
-                )
-
-            next_routes.append(target)
-        return next_routes
+        self.msg_recv = 0
+        self.msg_sent = 0
 
     async def send_message(self, msg: 'Message', **kwargs):
         """
@@ -56,12 +44,8 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
         routing_table = RoutingTable(msg.envelope.routing_table)
         next_targets = routing_table.get_next_targets()
 
-        for target, send_as_bind in next_targets:
+        for target, _ in next_targets:
             pod_address = target.active_target_pod.full_address
-            if send_as_bind:
-                raise ValueError(
-                    f'Grpclet can not send as bind to target {pod_address}'
-                )
 
             new_message = await self._add_envelope(msg, target)
 
@@ -69,6 +53,7 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
                 self._stubs[pod_address] = Grpclet._create_grpc_stub(pod_address)
 
             try:
+                self.msg_sent += 1
                 self._stubs[pod_address].Call(new_message)
             except grpc.RpcError as ex:
                 self._logger.error('Sending data request via grpc failed', ex)
@@ -159,4 +144,5 @@ class Grpclet(jina_pb2_grpc.JinaDataRequestRPCServicer):
                 'Grpclet received data request, but no callback was registered'
             )
 
+        self.msg_recv += 1
         return struct_pb2.Value()

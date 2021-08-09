@@ -1,5 +1,4 @@
 import time
-import traceback
 from abc import ABC
 from asyncio import CancelledError
 from collections import defaultdict
@@ -16,7 +15,6 @@ from jina.peapods.runtimes.request_handlers.data_request_handler import (
     DataRequestHandler,
 )
 from jina.proto import jina_pb2
-
 from jina.types.routing.table import RoutingTable
 
 
